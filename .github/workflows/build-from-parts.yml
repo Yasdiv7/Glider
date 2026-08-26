@@ -1,4 +1,4 @@
-name: Build Fixed Glider Packages
+name: Diagnose Glider Connection
 
 on:
   pull_request:
@@ -6,72 +6,7 @@ on:
   workflow_dispatch:
 
 jobs:
-  windows:
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Reconstruct source
-        shell: pwsh
-        run: |
-          $parts = Get-ChildItem source_parts\part??.b64 | Sort-Object Name
-          $b64 = ($parts | ForEach-Object { Get-Content $_.FullName -Raw }) -join ''
-          [IO.File]::WriteAllBytes("$env:RUNNER_TEMP\glider.zip", [Convert]::FromBase64String($b64))
-          Expand-Archive "$env:RUNNER_TEMP\glider.zip" -DestinationPath source
-
-      - name: Patch DXGI API calls
-        shell: pwsh
-        run: |
-          $path = 'source\Windows\GliderApp\ScreenCapture.cs'
-          $text = Get-Content $path -Raw
-          $text = $text.Replace('using var adapter = factory.GetAdapter1((uint)adapterIndex);', @'
-          if (!factory.EnumAdapters1((uint)adapterIndex, out IDXGIAdapter1? adapterResult).Success || adapterResult is null)
-              throw new InvalidOperationException($"DXGI adapter {adapterIndex} not found");
-          using var adapter = adapterResult;
-          '@.Trim())
-          $text = $text.Replace('using var output = adapter.GetOutput((uint)outputIndex);', @'
-          if (!adapter.EnumOutputs((uint)outputIndex, out IDXGIOutput? outputResult).Success || outputResult is null)
-              throw new InvalidOperationException($"DXGI output {outputIndex} not found");
-          using var output = outputResult;
-          '@.Trim())
-          Set-Content $path $text -NoNewline
-
-      - uses: actions/setup-dotnet@v4
-        with:
-          dotnet-version: '8.0.x'
-
-      - name: Download FFmpeg
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force -Path source\Windows\GliderApp\ffmpeg | Out-Null
-          Invoke-WebRequest "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip" -OutFile "$env:RUNNER_TEMP\ffmpeg.zip"
-          Expand-Archive "$env:RUNNER_TEMP\ffmpeg.zip" "$env:RUNNER_TEMP\ffmpeg"
-          $exe = Get-ChildItem "$env:RUNNER_TEMP\ffmpeg" -Recurse -Filter ffmpeg.exe | Select-Object -First 1
-          if (-not $exe) { throw 'ffmpeg.exe not found' }
-          Copy-Item $exe.FullName source\Windows\GliderApp\ffmpeg\ffmpeg.exe
-
-      - name: Publish self-contained Windows app
-        shell: pwsh
-        run: |
-          dotnet publish source\Windows\GliderApp\GliderApp.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=false -o source\publish
-          if (!(Test-Path source\publish\Glider.exe)) { throw 'Glider.exe missing' }
-
-      - name: Ensure FFmpeg is beside app
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force source\publish\ffmpeg | Out-Null
-          Copy-Item source\Windows\GliderApp\ffmpeg\ffmpeg.exe source\publish\ffmpeg\ffmpeg.exe -Force
-
-      - name: Create portable ZIP
-        shell: pwsh
-        run: Compress-Archive -Path source\publish\* -DestinationPath Glider-Windows-Portable.zip
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: Glider-Windows-Fixed
-          path: Glider-Windows-Portable.zip
-          if-no-files-found: error
-
-  android:
+  diagnose:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -82,58 +17,14 @@ jobs:
           base64 -d "$RUNNER_TEMP/glider.b64" > "$RUNNER_TEMP/glider.zip"
           mkdir source
           unzip -q "$RUNNER_TEMP/glider.zip" -d source
-
-      - name: Patch Android UI for vertical scrolling
+      - name: Show connection source
         shell: bash
         run: |
-          python3 - <<'PY'
-          from pathlib import Path
-          p = Path('source/Android/app/src/main/res/layout/activity_main.xml')
-          s = p.read_text(encoding='utf-8')
-          # Keep all existing IDs/views intact. Make the original root content-sized,
-          # then place it inside a full-screen vertical ScrollView.
-          if '<ScrollView' not in s:
-              stripped = s.lstrip()
-              if stripped.startswith('<?xml'):
-                  end = s.find('?>')
-                  decl = s[:end+2]
-                  body = s[end+2:].strip()
-              else:
-                  decl = '<?xml version="1.0" encoding="utf-8"?>'
-                  body = s.strip()
-              body = body.replace('android:layout_height="match_parent"', 'android:layout_height="wrap_content"', 1)
-              wrapped = f'''{decl}\n<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"\n    android:layout_width="match_parent"\n    android:layout_height="match_parent"\n    android:fillViewport="true"\n    android:scrollbars="vertical"\n    android:clipToPadding="false"\n    android:paddingBottom="24dp">\n\n{body}\n\n</ScrollView>\n'''
-              p.write_text(wrapped, encoding='utf-8')
-          PY
-
-      - name: Patch coroutine compile error
-        shell: bash
-        run: |
-          python3 - <<'PY'
-          from pathlib import Path
-          p=Path('source/Android/app/src/main/java/com/glider/app/DisplayActivity.kt')
-          s=p.read_text()
-          lines=s.splitlines()
-          for i,line in enumerate(lines):
-              if 'isActive' in line and 'currentCoroutineContext' not in line:
-                  lines[i]=line.replace('isActive','kotlinx.coroutines.currentCoroutineContext().isActive')
-          p.write_text('\n'.join(lines)+'\n')
-          PY
-
-      - uses: actions/setup-java@v5
-        with:
-          distribution: temurin
-          java-version: '17'
-      - uses: android-actions/setup-android@v3
-      - uses: gradle/actions/setup-gradle@v4
-        with:
-          gradle-version: '8.7'
-      - name: Build Android APK
-        working-directory: source/Android
-        shell: bash
-        run: gradle assembleDebug --no-daemon --max-workers=2
-      - uses: actions/upload-artifact@v4
-        with:
-          name: Glider-Android-Scrollable
-          path: source/Android/app/build/outputs/apk/debug/app-debug.apk
-          if-no-files-found: error
+          echo '===== Windows MainWindow ====='
+          sed -n '1,260p' source/Windows/GliderApp/MainWindow.xaml.cs
+          echo '===== Windows NetworkServer ====='
+          sed -n '1,320p' source/Windows/GliderApp/NetworkServer.cs
+          echo '===== Android MainActivity ====='
+          sed -n '1,320p' source/Android/app/src/main/java/com/glider/app/MainActivity.kt
+          echo '===== Android GldProtocol ====='
+          sed -n '1,320p' source/Android/app/src/main/java/com/glider/app/GldProtocol.kt
