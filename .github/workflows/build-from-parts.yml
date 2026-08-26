@@ -1,7 +1,9 @@
-name: Build Glider Binaries
+name: Build Glider Android
 
 on:
   workflow_dispatch:
+  pull_request:
+    branches: [ main ]
   push:
     branches: [ main ]
     paths:
@@ -9,88 +11,6 @@ on:
       - 'source_parts/**'
 
 jobs:
-  build-windows:
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Reconstruct source
-        shell: pwsh
-        run: |
-          $parts = Get-ChildItem source_parts\part??.b64 | Sort-Object Name
-          if ($parts.Count -ne 8) { throw "Expected 8 source parts, found $($parts.Count)" }
-          $b64 = ($parts | ForEach-Object { Get-Content $_.FullName -Raw }) -join ''
-          [IO.File]::WriteAllBytes("$env:RUNNER_TEMP\glider.zip", [Convert]::FromBase64String($b64))
-          Expand-Archive "$env:RUNNER_TEMP\glider.zip" -DestinationPath source
-          Get-FileHash "$env:RUNNER_TEMP\glider.zip" -Algorithm SHA256
-
-      - name: Patch DXGI enumeration
-        shell: pwsh
-        run: |
-          $path = 'source\Windows\GliderApp\ScreenCapture.cs'
-          $text = Get-Content $path -Raw
-          $oldAdapter = 'using var adapter = factory.GetAdapter1((uint)adapterIndex);'
-          $newAdapter = @'
-          if (!factory.EnumAdapters1((uint)adapterIndex, out IDXGIAdapter1? adapterResult).Success || adapterResult is null)
-              throw new InvalidOperationException($"DXGI adapter {adapterIndex} not found");
-          using var adapter = adapterResult;
-          '@
-          if (-not $text.Contains($oldAdapter)) { throw 'Expected GetAdapter1 line not found' }
-          $text = $text.Replace($oldAdapter, $newAdapter.Trim())
-
-          $oldOutput = 'using var output = adapter.GetOutput((uint)outputIndex);'
-          $newOutput = @'
-          if (!adapter.EnumOutputs((uint)outputIndex, out IDXGIOutput? outputResult).Success || outputResult is null)
-              throw new InvalidOperationException($"DXGI output {outputIndex} not found");
-          using var output = outputResult;
-          '@
-          if (-not $text.Contains($oldOutput)) { throw 'Expected GetOutput line not found' }
-          $text = $text.Replace($oldOutput, $newOutput.Trim())
-          Set-Content $path $text -NoNewline
-
-      - uses: actions/setup-dotnet@v4
-        with:
-          dotnet-version: '8.0.x'
-
-      - name: Download FFmpeg
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force -Path source\Windows\GliderApp\ffmpeg | Out-Null
-          Invoke-WebRequest "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip" -OutFile "$env:RUNNER_TEMP\ffmpeg.zip"
-          Expand-Archive "$env:RUNNER_TEMP\ffmpeg.zip" "$env:RUNNER_TEMP\ffmpeg"
-          $exe = Get-ChildItem "$env:RUNNER_TEMP\ffmpeg" -Recurse -Filter ffmpeg.exe | Select-Object -First 1
-          if (-not $exe) { throw 'ffmpeg.exe not found' }
-          Copy-Item $exe.FullName source\Windows\GliderApp\ffmpeg\ffmpeg.exe
-
-      - name: Publish Windows app
-        shell: pwsh
-        run: dotnet publish source\Windows\GliderApp\GliderApp.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -o source\publish_out
-
-      - name: Prepare installer assets
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force -Path source\installer_assets\drivers | Out-Null
-          Copy-Item source\publish_out\Glider.exe source\installer_assets\Glider.exe
-          Copy-Item source\Windows\GliderApp\logo.png source\installer_assets\logo.png
-          "Virtual display driver package can be added here." | Out-File source\installer_assets\drivers\README.txt
-
-      - name: Install Inno Setup
-        shell: pwsh
-        run: choco install innosetup -y --no-progress
-
-      - name: Build Windows installer
-        shell: pwsh
-        run: |
-          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
-          if (-not (Test-Path $iscc)) { $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" }
-          & $iscc source\installer\GliderSetup.iss
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: Glider-Windows-Setup
-          path: source/installer_output/Glider_Setup_9.0.exe
-          if-no-files-found: error
-
   build-android:
     runs-on: ubuntu-latest
     steps:
@@ -115,7 +35,7 @@ jobs:
           p = Path('source/Android/app/src/main/java/com/glider/app/DisplayActivity.kt')
           s = p.read_text()
           old = 'while (isActive)'
-          new = 'while (kotlinx.coroutines.currentCoroutineContext()[kotlinx.coroutines.Job]?.isActive == true)'
+          new = 'while (kotlinx.coroutines.currentCoroutineContext().isActive)'
           if old not in s:
               raise SystemExit('Expected while (isActive) not found')
           p.write_text(s.replace(old, new, 1))
@@ -141,23 +61,15 @@ jobs:
         run: |
           keytool -genkeypair -v -keystore source/glider.keystore -storepass glider123 -alias glider -keypass glider123 -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Glider,O=Glider,C=US"
 
-      - name: Build Android APK with retries
+      - name: Build Android APK
         working-directory: source/Android
         shell: bash
         run: |
-          set +e
-          for attempt in 1 2 3 4; do
-            echo "Gradle attempt $attempt/4"
-            gradle assembleRelease --no-daemon --max-workers=2 \
-              -Pandroid.injected.signing.store.file=../glider.keystore \
-              -Pandroid.injected.signing.store.password=glider123 \
-              -Pandroid.injected.signing.key.alias=glider \
-              -Pandroid.injected.signing.key.password=glider123
-            code=$?
-            if [ $code -eq 0 ]; then exit 0; fi
-            if [ $attempt -lt 4 ]; then sleep $((attempt * 45)); fi
-          done
-          exit $code
+          gradle assembleRelease --no-daemon --max-workers=2 \
+            -Pandroid.injected.signing.store.file=../glider.keystore \
+            -Pandroid.injected.signing.store.password=glider123 \
+            -Pandroid.injected.signing.key.alias=glider \
+            -Pandroid.injected.signing.key.password=glider123
 
       - uses: actions/upload-artifact@v4
         with:
