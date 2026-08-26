@@ -17,24 +17,54 @@ jobs:
           $b64 = ($parts | ForEach-Object { Get-Content $_.FullName -Raw }) -join ''
           [IO.File]::WriteAllBytes("$env:RUNNER_TEMP\glider.zip", [Convert]::FromBase64String($b64))
           Expand-Archive "$env:RUNNER_TEMP\glider.zip" -DestinationPath source
+
+      - name: Patch DXGI API calls
+        shell: pwsh
+        run: |
+          $path = 'source\Windows\GliderApp\ScreenCapture.cs'
+          $text = Get-Content $path -Raw
+          $text = $text.Replace('using var adapter = factory.GetAdapter1((uint)adapterIndex);', @'
+          if (!factory.EnumAdapters1((uint)adapterIndex, out IDXGIAdapter1? adapterResult).Success || adapterResult is null)
+              throw new InvalidOperationException($"DXGI adapter {adapterIndex} not found");
+          using var adapter = adapterResult;
+          '@.Trim())
+          $text = $text.Replace('using var output = adapter.GetOutput((uint)outputIndex);', @'
+          if (!adapter.EnumOutputs((uint)outputIndex, out IDXGIOutput? outputResult).Success || outputResult is null)
+              throw new InvalidOperationException($"DXGI output {outputIndex} not found");
+          using var output = outputResult;
+          '@.Trim())
+          Set-Content $path $text -NoNewline
+
       - uses: actions/setup-dotnet@v4
         with:
           dotnet-version: '8.0.x'
+
+      - name: Download FFmpeg
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path source\Windows\GliderApp\ffmpeg | Out-Null
+          Invoke-WebRequest "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip" -OutFile "$env:RUNNER_TEMP\ffmpeg.zip"
+          Expand-Archive "$env:RUNNER_TEMP\ffmpeg.zip" "$env:RUNNER_TEMP\ffmpeg"
+          $exe = Get-ChildItem "$env:RUNNER_TEMP\ffmpeg" -Recurse -Filter ffmpeg.exe | Select-Object -First 1
+          if (-not $exe) { throw 'ffmpeg.exe not found' }
+          Copy-Item $exe.FullName source\Windows\GliderApp\ffmpeg\ffmpeg.exe
+
       - name: Publish self-contained Windows app
         shell: pwsh
         run: |
           dotnet publish source\Windows\GliderApp\GliderApp.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=false -o source\publish
           if (!(Test-Path source\publish\Glider.exe)) { throw 'Glider.exe missing' }
-      - name: Add FFmpeg if source contains it
+
+      - name: Ensure FFmpeg is beside app
         shell: pwsh
         run: |
-          if (Test-Path source\Windows\GliderApp\ffmpeg\ffmpeg.exe) {
-            New-Item -ItemType Directory -Force source\publish\ffmpeg | Out-Null
-            Copy-Item source\Windows\GliderApp\ffmpeg\ffmpeg.exe source\publish\ffmpeg\ffmpeg.exe -Force
-          }
+          New-Item -ItemType Directory -Force source\publish\ffmpeg | Out-Null
+          Copy-Item source\Windows\GliderApp\ffmpeg\ffmpeg.exe source\publish\ffmpeg\ffmpeg.exe -Force
+
       - name: Create portable ZIP
         shell: pwsh
         run: Compress-Archive -Path source\publish\* -DestinationPath Glider-Windows-Portable.zip
+
       - uses: actions/upload-artifact@v4
         with:
           name: Glider-Windows-Fixed
