@@ -24,19 +24,28 @@ jobs:
           Expand-Archive "$env:RUNNER_TEMP\glider.zip" -DestinationPath source
           Get-FileHash "$env:RUNNER_TEMP\glider.zip" -Algorithm SHA256
 
-      - name: Patch DXGI adapter enumeration
+      - name: Patch DXGI enumeration
         shell: pwsh
         run: |
           $path = 'source\Windows\GliderApp\ScreenCapture.cs'
           $text = Get-Content $path -Raw
-          $old = 'using var adapter = factory.GetAdapter1((uint)adapterIndex);'
-          $new = @'
+          $oldAdapter = 'using var adapter = factory.GetAdapter1((uint)adapterIndex);'
+          $newAdapter = @'
           if (!factory.EnumAdapters1((uint)adapterIndex, out IDXGIAdapter1? adapterResult).Success || adapterResult is null)
               throw new InvalidOperationException($"DXGI adapter {adapterIndex} not found");
           using var adapter = adapterResult;
           '@
-          if (-not $text.Contains($old)) { throw 'Expected GetAdapter1 line not found' }
-          $text = $text.Replace($old, $new.Trim())
+          if (-not $text.Contains($oldAdapter)) { throw 'Expected GetAdapter1 line not found' }
+          $text = $text.Replace($oldAdapter, $newAdapter.Trim())
+
+          $oldOutput = 'using var output = adapter.GetOutput((uint)outputIndex);'
+          $newOutput = @'
+          if (!adapter.EnumOutputs((uint)outputIndex, out IDXGIOutput? outputResult).Success || outputResult is null)
+              throw new InvalidOperationException($"DXGI output {outputIndex} not found");
+          using var output = outputResult;
+          '@
+          if (-not $text.Contains($oldOutput)) { throw 'Expected GetOutput line not found' }
+          $text = $text.Replace($oldOutput, $newOutput.Trim())
           Set-Content $path $text -NoNewline
 
       - uses: actions/setup-dotnet@v4
