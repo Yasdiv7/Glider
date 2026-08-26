@@ -18,6 +18,7 @@ jobs:
         shell: pwsh
         run: |
           $parts = Get-ChildItem source_parts\part??.b64 | Sort-Object Name
+          if ($parts.Count -ne 8) { throw "Expected 8 source parts, found $($parts.Count)" }
           $b64 = ($parts | ForEach-Object { Get-Content $_.FullName -Raw }) -join ''
           [IO.File]::WriteAllBytes("$env:RUNNER_TEMP\glider.zip", [Convert]::FromBase64String($b64))
           Expand-Archive "$env:RUNNER_TEMP\glider.zip" -DestinationPath source
@@ -73,6 +74,7 @@ jobs:
       - name: Reconstruct source
         shell: bash
         run: |
+          test "$(find source_parts -maxdepth 1 -name 'part??.b64' | wc -l)" -eq 8
           cat source_parts/part??.b64 > "$RUNNER_TEMP/glider.b64"
           base64 -d "$RUNNER_TEMP/glider.b64" > "$RUNNER_TEMP/glider.zip"
           unzip -t "$RUNNER_TEMP/glider.zip"
