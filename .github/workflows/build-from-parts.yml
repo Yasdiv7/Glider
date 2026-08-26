@@ -82,6 +82,30 @@ jobs:
           base64 -d "$RUNNER_TEMP/glider.b64" > "$RUNNER_TEMP/glider.zip"
           mkdir source
           unzip -q "$RUNNER_TEMP/glider.zip" -d source
+
+      - name: Patch Android UI for vertical scrolling
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('source/Android/app/src/main/res/layout/activity_main.xml')
+          s = p.read_text(encoding='utf-8')
+          # Keep all existing IDs/views intact. Make the original root content-sized,
+          # then place it inside a full-screen vertical ScrollView.
+          if '<ScrollView' not in s:
+              stripped = s.lstrip()
+              if stripped.startswith('<?xml'):
+                  end = s.find('?>')
+                  decl = s[:end+2]
+                  body = s[end+2:].strip()
+              else:
+                  decl = '<?xml version="1.0" encoding="utf-8"?>'
+                  body = s.strip()
+              body = body.replace('android:layout_height="match_parent"', 'android:layout_height="wrap_content"', 1)
+              wrapped = f'''{decl}\n<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"\n    android:layout_width="match_parent"\n    android:layout_height="match_parent"\n    android:fillViewport="true"\n    android:scrollbars="vertical"\n    android:clipToPadding="false"\n    android:paddingBottom="24dp">\n\n{body}\n\n</ScrollView>\n'''
+              p.write_text(wrapped, encoding='utf-8')
+          PY
+
       - name: Patch coroutine compile error
         shell: bash
         run: |
@@ -95,6 +119,7 @@ jobs:
                   lines[i]=line.replace('isActive','kotlinx.coroutines.currentCoroutineContext().isActive')
           p.write_text('\n'.join(lines)+'\n')
           PY
+
       - uses: actions/setup-java@v5
         with:
           distribution: temurin
@@ -109,6 +134,6 @@ jobs:
         run: gradle assembleDebug --no-daemon --max-workers=2
       - uses: actions/upload-artifact@v4
         with:
-          name: Glider-Android-Fixed
+          name: Glider-Android-Scrollable
           path: source/Android/app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
