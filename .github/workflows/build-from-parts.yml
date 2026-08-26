@@ -1,78 +1,36 @@
-name: Build Glider Android
+name: Diagnose Glider Startup
 
 on:
-  workflow_dispatch:
   pull_request:
     branches: [ main ]
-  push:
-    branches: [ main ]
-    paths:
-      - '.github/workflows/build-from-parts.yml'
-      - 'source_parts/**'
+  workflow_dispatch:
 
 jobs:
-  build-android:
-    runs-on: ubuntu-latest
+  diagnose-windows:
+    runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
 
       - name: Reconstruct source
-        shell: bash
+        shell: pwsh
         run: |
-          test "$(find source_parts -maxdepth 1 -name 'part??.b64' | wc -l)" -eq 8
-          cat source_parts/part??.b64 > "$RUNNER_TEMP/glider.b64"
-          base64 -d "$RUNNER_TEMP/glider.b64" > "$RUNNER_TEMP/glider.zip"
-          unzip -t "$RUNNER_TEMP/glider.zip"
-          mkdir source
-          unzip -q "$RUNNER_TEMP/glider.zip" -d source
-          sha256sum "$RUNNER_TEMP/glider.zip"
+          $parts = Get-ChildItem source_parts\part??.b64 | Sort-Object Name
+          $b64 = ($parts | ForEach-Object { Get-Content $_.FullName -Raw }) -join ''
+          [IO.File]::WriteAllBytes("$env:RUNNER_TEMP\glider.zip", [Convert]::FromBase64String($b64))
+          Expand-Archive "$env:RUNNER_TEMP\glider.zip" -DestinationPath source
 
-      - name: Patch Android coroutine loop
-        shell: bash
+      - name: Show startup source
+        shell: pwsh
         run: |
-          python3 - <<'PY'
-          from pathlib import Path
-          p = Path('source/Android/app/src/main/java/com/glider/app/DisplayActivity.kt')
-          s = p.read_text()
-          old = 'while (isActive)'
-          new = 'while (kotlinx.coroutines.currentCoroutineContext().isActive)'
-          if old not in s:
-              raise SystemExit('Expected while (isActive) not found')
-          p.write_text(s.replace(old, new, 1))
-          PY
-
-      - uses: actions/setup-java@v5
-        with:
-          distribution: temurin
-          java-version: '17'
-
-      - uses: android-actions/setup-android@v3
-
-      - name: Install Android SDK 35
-        shell: bash
-        run: yes | sdkmanager "platforms;android-35" "build-tools;35.0.0" || true
-
-      - uses: gradle/actions/setup-gradle@v4
-        with:
-          gradle-version: '8.7'
-
-      - name: Generate signing key
-        shell: bash
-        run: |
-          keytool -genkeypair -v -keystore source/glider.keystore -storepass glider123 -alias glider -keypass glider123 -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Glider,O=Glider,C=US"
-
-      - name: Build Android APK
-        working-directory: source/Android
-        shell: bash
-        run: |
-          gradle assembleRelease --no-daemon --max-workers=2 \
-            -Pandroid.injected.signing.store.file=../glider.keystore \
-            -Pandroid.injected.signing.store.password=glider123 \
-            -Pandroid.injected.signing.key.alias=glider \
-            -Pandroid.injected.signing.key.password=glider123
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: Glider-Android-APK
-          path: source/Android/app/build/outputs/apk/release/app-release.apk
-          if-no-files-found: error
+          Write-Host '===== App.xaml ====='
+          Get-Content source\Windows\GliderApp\App.xaml
+          Write-Host '===== App.xaml.cs ====='
+          Get-Content source\Windows\GliderApp\App.xaml.cs
+          Write-Host '===== GliderApp.csproj ====='
+          Get-Content source\Windows\GliderApp\GliderApp.csproj
+          Write-Host '===== MainWindow.xaml.cs (first 220 lines) ====='
+          Get-Content source\Windows\GliderApp\MainWindow.xaml.cs | Select-Object -First 220
+          Write-Host '===== MainWindow.xaml (first 220 lines) ====='
+          Get-Content source\Windows\GliderApp\MainWindow.xaml | Select-Object -First 220
+          Write-Host '===== Installer ====='
+          Get-Content source\installer\GliderSetup.iss
