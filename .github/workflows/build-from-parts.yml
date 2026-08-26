@@ -1,0 +1,112 @@
+name: Build Glider Binaries
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+    paths:
+      - '.github/workflows/build-from-parts.yml'
+      - 'source_parts/**'
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Reconstruct source
+        shell: pwsh
+        run: |
+          $parts = Get-ChildItem source_parts\part??.b64 | Sort-Object Name
+          $b64 = ($parts | ForEach-Object { Get-Content $_.FullName -Raw }) -join ''
+          [IO.File]::WriteAllBytes("$env:RUNNER_TEMP\glider.zip", [Convert]::FromBase64String($b64))
+          Expand-Archive "$env:RUNNER_TEMP\glider.zip" -DestinationPath source
+          Get-FileHash "$env:RUNNER_TEMP\glider.zip" -Algorithm SHA256
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Download FFmpeg
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path source\Windows\GliderApp\ffmpeg | Out-Null
+          Invoke-WebRequest "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip" -OutFile "$env:RUNNER_TEMP\ffmpeg.zip"
+          Expand-Archive "$env:RUNNER_TEMP\ffmpeg.zip" "$env:RUNNER_TEMP\ffmpeg"
+          $exe = Get-ChildItem "$env:RUNNER_TEMP\ffmpeg" -Recurse -Filter ffmpeg.exe | Select-Object -First 1
+          if (-not $exe) { throw 'ffmpeg.exe not found' }
+          Copy-Item $exe.FullName source\Windows\GliderApp\ffmpeg\ffmpeg.exe
+
+      - name: Publish Windows app
+        shell: pwsh
+        run: dotnet publish source\Windows\GliderApp\GliderApp.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -o source\publish_out
+
+      - name: Prepare installer assets
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path source\installer_assets\drivers | Out-Null
+          Copy-Item source\publish_out\Glider.exe source\installer_assets\Glider.exe
+          "Virtual display driver package can be added here." | Out-File source\installer_assets\drivers\README.txt
+
+      - name: Install Inno Setup
+        shell: pwsh
+        run: choco install innosetup -y --no-progress
+
+      - name: Build Windows installer
+        shell: pwsh
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" }
+          & $iscc source\installer\GliderSetup.iss
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Glider-Windows-Setup
+          path: source/installer_output/Glider_Setup_9.0.exe
+          if-no-files-found: error
+
+  build-android:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Reconstruct source
+        shell: bash
+        run: |
+          cat source_parts/part??.b64 > "$RUNNER_TEMP/glider.b64"
+          base64 -d "$RUNNER_TEMP/glider.b64" > "$RUNNER_TEMP/glider.zip"
+          unzip -t "$RUNNER_TEMP/glider.zip"
+          mkdir source
+          unzip -q "$RUNNER_TEMP/glider.zip" -d source
+          sha256sum "$RUNNER_TEMP/glider.zip"
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK 35
+        shell: bash
+        run: yes | sdkmanager "platforms;android-35" "build-tools;35.0.0" || true
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      - name: Generate signing key
+        shell: bash
+        run: |
+          keytool -genkeypair -v -keystore source/glider.keystore -storepass glider123 -alias glider -keypass glider123 -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Glider,O=Glider,C=US"
+
+      - name: Build Android APK
+        working-directory: source/Android
+        shell: bash
+        run: gradle assembleRelease -Pandroid.injected.signing.store.file=../glider.keystore -Pandroid.injected.signing.store.password=glider123 -Pandroid.injected.signing.key.alias=glider -Pandroid.injected.signing.key.password=glider123
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Glider-Android-APK
+          path: source/Android/app/build/outputs/apk/release/app-release.apk
+          if-no-files-found: error
