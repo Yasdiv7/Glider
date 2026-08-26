@@ -1,4 +1,4 @@
-name: Diagnose Glider Connection
+name: Build Glider USB Discovery Fix
 
 on:
   pull_request:
@@ -6,7 +6,82 @@ on:
   workflow_dispatch:
 
 jobs:
-  diagnose:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Reconstruct source
+        shell: pwsh
+        run: |
+          $parts = Get-ChildItem source_parts\part??.b64 | Sort-Object Name
+          $b64 = ($parts | ForEach-Object { Get-Content $_.FullName -Raw }) -join ''
+          [IO.File]::WriteAllBytes("$env:RUNNER_TEMP\glider.zip", [Convert]::FromBase64String($b64))
+          Expand-Archive "$env:RUNNER_TEMP\glider.zip" -DestinationPath source
+
+      - name: Patch Windows connection and DXGI
+        shell: pwsh
+        run: |
+          $main = 'source\Windows\GliderApp\MainWindow.xaml.cs'
+          $text = Get-Content $main -Raw
+          $old = @'
+            var bindIp = FindUsbRndisAdapterIp();
+            if (bindIp == null)
+            {
+                StatusText.Text = "فعّل USB tethering من الأندرويد وشغّل الكابل الأول";
+                return;
+            }
+'@
+          $new = @'
+            // Listen on every IPv4 interface. Adapter names vary heavily between
+            // Samsung/Google/Windows drivers and must not gate the connection.
+            var bindIp = IPAddress.Any;
+'@
+          $text = $text.Replace($old, $new)
+          Set-Content $main $text -NoNewline
+
+          $cap = 'source\Windows\GliderApp\ScreenCapture.cs'
+          $c = Get-Content $cap -Raw
+          $c = $c.Replace('using var adapter = factory.GetAdapter1((uint)adapterIndex);', @'
+          if (!factory.EnumAdapters1((uint)adapterIndex, out IDXGIAdapter1? adapterResult).Success || adapterResult is null)
+              throw new InvalidOperationException($"DXGI adapter {adapterIndex} not found");
+          using var adapter = adapterResult;
+          '@.Trim())
+          $c = $c.Replace('using var output = adapter.GetOutput((uint)outputIndex);', @'
+          if (!adapter.EnumOutputs((uint)outputIndex, out IDXGIOutput? outputResult).Success || outputResult is null)
+              throw new InvalidOperationException($"DXGI output {outputIndex} not found");
+          using var output = outputResult;
+          '@.Trim())
+          Set-Content $cap $c -NoNewline
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Download FFmpeg
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path source\Windows\GliderApp\ffmpeg | Out-Null
+          Invoke-WebRequest "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip" -OutFile "$env:RUNNER_TEMP\ffmpeg.zip"
+          Expand-Archive "$env:RUNNER_TEMP\ffmpeg.zip" "$env:RUNNER_TEMP\ffmpeg"
+          $exe = Get-ChildItem "$env:RUNNER_TEMP\ffmpeg" -Recurse -Filter ffmpeg.exe | Select-Object -First 1
+          if (-not $exe) { throw 'ffmpeg.exe not found' }
+          Copy-Item $exe.FullName source\Windows\GliderApp\ffmpeg\ffmpeg.exe
+
+      - name: Publish Windows self-contained
+        shell: pwsh
+        run: |
+          dotnet publish source\Windows\GliderApp\GliderApp.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=false -o source\publish
+          New-Item -ItemType Directory -Force source\publish\ffmpeg | Out-Null
+          Copy-Item source\Windows\GliderApp\ffmpeg\ffmpeg.exe source\publish\ffmpeg\ffmpeg.exe -Force
+          Compress-Archive -Path source\publish\* -DestinationPath Glider-Windows-USB-Fix.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Glider-Windows-USB-Fix
+          path: Glider-Windows-USB-Fix.zip
+          if-no-files-found: error
+
+  android:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -17,14 +92,75 @@ jobs:
           base64 -d "$RUNNER_TEMP/glider.b64" > "$RUNNER_TEMP/glider.zip"
           mkdir source
           unzip -q "$RUNNER_TEMP/glider.zip" -d source
-      - name: Show connection source
+
+      - name: Patch Android discovery, scrolling and coroutine
         shell: bash
         run: |
-          echo '===== Windows MainWindow ====='
-          sed -n '1,260p' source/Windows/GliderApp/MainWindow.xaml.cs
-          echo '===== Windows NetworkServer ====='
-          sed -n '1,320p' source/Windows/GliderApp/NetworkServer.cs
-          echo '===== Android MainActivity ====='
-          sed -n '1,320p' source/Android/app/src/main/java/com/glider/app/MainActivity.kt
-          echo '===== Android GldProtocol ====='
-          sed -n '1,320p' source/Android/app/src/main/java/com/glider/app/GldProtocol.kt
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          # Keep the main UI scrollable.
+          p = Path('source/Android/app/src/main/res/layout/activity_main.xml')
+          s = p.read_text(encoding='utf-8')
+          if '<ScrollView' not in s:
+              if s.lstrip().startswith('<?xml'):
+                  end=s.find('?>'); decl=s[:end+2]; body=s[end+2:].strip()
+              else:
+                  decl='<?xml version="1.0" encoding="utf-8"?>'; body=s.strip()
+              body=body.replace('android:layout_height="match_parent"','android:layout_height="wrap_content"',1)
+              s=f'''{decl}\n<ScrollView xmlns:android="http://schemas.android.com/apk/res/android" android:layout_width="match_parent" android:layout_height="match_parent" android:fillViewport="true" android:scrollbars="vertical" android:clipToPadding="false" android:paddingBottom="24dp">\n{body}\n</ScrollView>\n'''
+              p.write_text(s,encoding='utf-8')
+
+          # Windows is NOT Android's gateway during USB tethering. Discover the PC
+          # by scanning the tether subnet for Glider's TCP port instead.
+          p=Path('source/Android/app/src/main/java/com/glider/app/MainActivity.kt')
+          s=p.read_text(encoding='utf-8')
+          if 'import java.net.Socket' not in s:
+              s=s.replace('import java.net.NetworkInterface','import java.net.NetworkInterface\nimport java.net.Socket\nimport java.net.InetSocketAddress')
+
+          old='''            val host = findWindowsHostViaUsbTether()\n            if (host == null) {\n                status.text = "فعّل USB tethering من إعدادات الأندرويد الأول"\n                Toast.makeText(this, "شغّل USB tethering ووصّل السلك بالويندوز", Toast.LENGTH_LONG).show()\n                return@setOnClickListener\n            }\n            status.text = "بيتصل بـ $host..."\n            val intent = Intent(this, DisplayActivity::class.java)\n            intent.putExtra(DisplayActivity.EXTRA_HOST, host)\n            intent.putExtra(DisplayActivity.EXTRA_MODE, mode)\n            startActivity(intent)'''
+          new='''            status.text = "بيدور على الكمبيوتر عبر USB..."\n            startButton.isEnabled = false\n            Thread {\n                val host = findWindowsHostViaUsbTether()\n                runOnUiThread {\n                    startButton.isEnabled = true\n                    if (host == null) {\n                        status.text = "مش لاقي Glider على الكمبيوتر"\n                        Toast.makeText(this, "شغّل Glider على Windows وفعّل USB tethering", Toast.LENGTH_LONG).show()\n                    } else {\n                        status.text = "اتلاقى الكمبيوتر: $host"\n                        val intent = Intent(this, DisplayActivity::class.java)\n                        intent.putExtra(DisplayActivity.EXTRA_HOST, host)\n                        intent.putExtra(DisplayActivity.EXTRA_MODE, mode)\n                        startActivity(intent)\n                    }\n                }\n            }.start()'''
+          s=s.replace(old,new)
+
+          start=s.find('    private fun findWindowsHostViaUsbTether(): String? {')
+          if start < 0: raise SystemExit('discovery function not found')
+          # Find matching function close by counting braces.
+          brace=s.find('{',start); depth=0; end=None
+          for i in range(brace,len(s)):
+              if s[i]=='{': depth+=1
+              elif s[i]=='}':
+                  depth-=1
+                  if depth==0:
+                      end=i+1; break
+          if end is None: raise SystemExit('function end not found')
+          fn='''    private fun findWindowsHostViaUsbTether(): String? {\n        val candidates = LinkedHashSet<String>()\n        try {\n            val ifaces = NetworkInterface.getNetworkInterfaces()\n            for (iface in ifaces) {\n                if (!iface.isUp || iface.isLoopback) continue\n                for (addr in iface.inetAddresses) {\n                    if (addr is java.net.Inet4Address && !addr.isLoopbackAddress) {\n                        val parts = addr.hostAddress?.split(".") ?: continue\n                        if (parts.size != 4) continue\n                        val prefix = "${parts[0]}.${parts[1]}.${parts[2]}"\n                        // Common tether hosts first, then the whole /24.\n                        for (last in listOf(1,2,100,101,129,254)) candidates.add("$prefix.$last")\n                        for (last in 1..254) candidates.add("$prefix.$last")\n                    }\n                }\n            }\n            for (host in candidates) {\n                try {\n                    Socket().use { sock ->\n                        sock.connect(InetSocketAddress(host, GldProtocol.PORT), 90)\n                        return host\n                    }\n                } catch (_: Exception) {}\n            }\n        } catch (_: Exception) {}\n        return null\n    }'''
+          s=s[:start]+fn+s[end:]
+          p.write_text(s,encoding='utf-8')
+
+          p=Path('source/Android/app/src/main/java/com/glider/app/DisplayActivity.kt')
+          s=p.read_text()
+          lines=s.splitlines()
+          for i,line in enumerate(lines):
+              if 'isActive' in line and 'currentCoroutineContext' not in line:
+                  lines[i]=line.replace('isActive','kotlinx.coroutines.currentCoroutineContext().isActive')
+          p.write_text('\n'.join(lines)+'\n')
+          PY
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: android-actions/setup-android@v3
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+      - name: Build Android APK
+        working-directory: source/Android
+        shell: bash
+        run: gradle assembleDebug --no-daemon --max-workers=2
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Glider-Android-USB-Fix
+          path: source/Android/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
