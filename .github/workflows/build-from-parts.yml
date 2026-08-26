@@ -5,6 +5,8 @@ on:
     branches: [ main ]
   workflow_dispatch:
 
+# Trigger rebuild after USB discovery fixes.
+
 jobs:
   windows:
     runs-on: windows-latest
@@ -100,7 +102,6 @@ jobs:
           from pathlib import Path
           import re
 
-          # Keep the main UI scrollable.
           p = Path('source/Android/app/src/main/res/layout/activity_main.xml')
           s = p.read_text(encoding='utf-8')
           if '<ScrollView' not in s:
@@ -112,8 +113,6 @@ jobs:
               s=f'''{decl}\n<ScrollView xmlns:android="http://schemas.android.com/apk/res/android" android:layout_width="match_parent" android:layout_height="match_parent" android:fillViewport="true" android:scrollbars="vertical" android:clipToPadding="false" android:paddingBottom="24dp">\n{body}\n</ScrollView>\n'''
               p.write_text(s,encoding='utf-8')
 
-          # Windows is NOT Android's gateway during USB tethering. Discover the PC
-          # by scanning the tether subnet for Glider's TCP port instead.
           p=Path('source/Android/app/src/main/java/com/glider/app/MainActivity.kt')
           s=p.read_text(encoding='utf-8')
           if 'import java.net.Socket' not in s:
@@ -125,7 +124,6 @@ jobs:
 
           start=s.find('    private fun findWindowsHostViaUsbTether(): String? {')
           if start < 0: raise SystemExit('discovery function not found')
-          # Find matching function close by counting braces.
           brace=s.find('{',start); depth=0; end=None
           for i in range(brace,len(s)):
               if s[i]=='{': depth+=1
@@ -134,7 +132,7 @@ jobs:
                   if depth==0:
                       end=i+1; break
           if end is None: raise SystemExit('function end not found')
-          fn='''    private fun findWindowsHostViaUsbTether(): String? {\n        val candidates = LinkedHashSet<String>()\n        try {\n            val ifaces = NetworkInterface.getNetworkInterfaces()\n            for (iface in ifaces) {\n                if (!iface.isUp || iface.isLoopback) continue\n                for (addr in iface.inetAddresses) {\n                    if (addr is java.net.Inet4Address && !addr.isLoopbackAddress) {\n                        val parts = addr.hostAddress?.split(".") ?: continue\n                        if (parts.size != 4) continue\n                        val prefix = "${parts[0]}.${parts[1]}.${parts[2]}"\n                        // Common tether hosts first, then the whole /24.\n                        for (last in listOf(1,2,100,101,129,254)) candidates.add("$prefix.$last")\n                        for (last in 1..254) candidates.add("$prefix.$last")\n                    }\n                }\n            }\n            for (host in candidates) {\n                try {\n                    Socket().use { sock ->\n                        sock.connect(InetSocketAddress(host, GldProtocol.PORT), 90)\n                        return host\n                    }\n                } catch (_: Exception) {}\n            }\n        } catch (_: Exception) {}\n        return null\n    }'''
+          fn='''    private fun findWindowsHostViaUsbTether(): String? {\n        val candidates = LinkedHashSet<String>()\n        try {\n            val ifaces = NetworkInterface.getNetworkInterfaces()\n            for (iface in ifaces) {\n                if (!iface.isUp || iface.isLoopback) continue\n                for (addr in iface.inetAddresses) {\n                    if (addr is java.net.Inet4Address && !addr.isLoopbackAddress) {\n                        val parts = addr.hostAddress?.split(".") ?: continue\n                        if (parts.size != 4) continue\n                        val prefix = "${parts[0]}.${parts[1]}.${parts[2]}"\n                        for (last in listOf(1,2,100,101,129,254)) candidates.add("$prefix.$last")\n                        for (last in 1..254) candidates.add("$prefix.$last")\n                    }\n                }\n            }\n            for (host in candidates) {\n                try {\n                    Socket().use { sock ->\n                        sock.connect(InetSocketAddress(host, GldProtocol.PORT), 90)\n                        return host\n                    }\n                } catch (_: Exception) {}\n            }\n        } catch (_: Exception) {}\n        return null\n    }'''
           s=s[:start]+fn+s[end:]
           p.write_text(s,encoding='utf-8')
 
