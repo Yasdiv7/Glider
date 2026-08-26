@@ -107,6 +107,20 @@ jobs:
           unzip -q "$RUNNER_TEMP/glider.zip" -d source
           sha256sum "$RUNNER_TEMP/glider.zip"
 
+      - name: Patch Android coroutine loop
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('source/Android/app/src/main/java/com/glider/app/DisplayActivity.kt')
+          s = p.read_text()
+          old = 'while (isActive)'
+          new = 'while (kotlinx.coroutines.currentCoroutineContext()[kotlinx.coroutines.Job]?.isActive == true)'
+          if old not in s:
+              raise SystemExit('Expected while (isActive) not found')
+          p.write_text(s.replace(old, new, 1))
+          PY
+
       - uses: actions/setup-java@v5
         with:
           distribution: temurin
