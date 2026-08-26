@@ -24,6 +24,21 @@ jobs:
           Expand-Archive "$env:RUNNER_TEMP\glider.zip" -DestinationPath source
           Get-FileHash "$env:RUNNER_TEMP\glider.zip" -Algorithm SHA256
 
+      - name: Patch DXGI adapter enumeration
+        shell: pwsh
+        run: |
+          $path = 'source\Windows\GliderApp\ScreenCapture.cs'
+          $text = Get-Content $path -Raw
+          $old = 'using var adapter = factory.GetAdapter1((uint)adapterIndex);'
+          $new = @'
+          if (!factory.EnumAdapters1((uint)adapterIndex, out IDXGIAdapter1? adapterResult).Success || adapterResult is null)
+              throw new InvalidOperationException($"DXGI adapter {adapterIndex} not found");
+          using var adapter = adapterResult;
+          '@
+          if (-not $text.Contains($old)) { throw 'Expected GetAdapter1 line not found' }
+          $text = $text.Replace($old, $new.Trim())
+          Set-Content $path $text -NoNewline
+
       - uses: actions/setup-dotnet@v4
         with:
           dotnet-version: '8.0.x'
@@ -82,7 +97,7 @@ jobs:
           unzip -q "$RUNNER_TEMP/glider.zip" -d source
           sha256sum "$RUNNER_TEMP/glider.zip"
 
-      - uses: actions/setup-java@v4
+      - uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: '17'
@@ -102,10 +117,23 @@ jobs:
         run: |
           keytool -genkeypair -v -keystore source/glider.keystore -storepass glider123 -alias glider -keypass glider123 -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Glider,O=Glider,C=US"
 
-      - name: Build Android APK
+      - name: Build Android APK with retries
         working-directory: source/Android
         shell: bash
-        run: gradle assembleRelease -Pandroid.injected.signing.store.file=../glider.keystore -Pandroid.injected.signing.store.password=glider123 -Pandroid.injected.signing.key.alias=glider -Pandroid.injected.signing.key.password=glider123
+        run: |
+          set +e
+          for attempt in 1 2 3 4; do
+            echo "Gradle attempt $attempt/4"
+            gradle assembleRelease --no-daemon --max-workers=2 \
+              -Pandroid.injected.signing.store.file=../glider.keystore \
+              -Pandroid.injected.signing.store.password=glider123 \
+              -Pandroid.injected.signing.key.alias=glider \
+              -Pandroid.injected.signing.key.password=glider123
+            code=$?
+            if [ $code -eq 0 ]; then exit 0; fi
+            if [ $attempt -lt 4 ]; then sleep $((attempt * 45)); fi
+          done
+          exit $code
 
       - uses: actions/upload-artifact@v4
         with:
